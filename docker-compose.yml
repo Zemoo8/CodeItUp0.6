@@ -1,0 +1,41 @@
+version: '3.8'
+name: codeitup-sandy-lab
+services:
+  sandy-db:
+    image: all4n1/codeitup-postgres:latest   # your published image
+    container_name: codeitup-sandy-lab
+    environment:
+      POSTGRES_DB: sandy_lab
+      POSTGRES_USER: sandy
+      POSTGRES_PASSWORD: sandy123
+    ports:
+      - "5433:5432"
+    volumes:
+      - sandy-db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # Optional pgAdmin – if you have pgAdmin installed locally, you can comment the pgadmin below.
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: codeitup-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: sandy@bikini-bottom.com
+      PGADMIN_DEFAULT_PASSWORD: sandy123
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    depends_on:
+      - sandy-db
+    restart: unless-stopped
+
+volumes:
+  sandy-db-data:
+    name: codeitup-sandy-db-data
+  pgadmin-data:
+    name: codeitup-pgadmin-data
+
+networks:
+  codeitup-network:
+    driver: bridge
+    name: codeitup-network
