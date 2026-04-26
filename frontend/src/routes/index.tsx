@@ -104,6 +104,12 @@ interface ChatResponse {
   reply: string;
   data_source: string;
   agent_used?: string | null;
+  error?: boolean;
+}
+
+interface ChatMessagePayload {
+  role: "user" | "assistant";
+  content: string;
 }
 
 function normalizeAgent(agentUsed?: string | null): AgentId {
@@ -117,11 +123,15 @@ function normalizeAgent(agentUsed?: string | null): AgentId {
   }
 }
 
-async function callChat(message: string, signal: AbortSignal): Promise<ChatResponse> {
+async function callChat(
+  message: string,
+  history: ChatMessagePayload[],
+  signal: AbortSignal,
+): Promise<ChatResponse> {
   const res = await fetch(`${API_BASE}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, history }),
     signal,
   });
   if (!res.ok) throw new Error(`Backend returned ${res.status}`);
@@ -199,8 +209,15 @@ function ChatPage() {
       abortRef.current = ctrl;
       const timer = setTimeout(() => ctrl.abort(), 20000); // 20s hard timeout
 
+      const history = [...messages, { id: Date.now(), role: "user", text: trimmed }]
+        .slice(-8)
+        .map((msg) => ({
+          role: msg.role === "ai" ? ("assistant" as const) : ("user" as const),
+          content: msg.text,
+        }));
+
       try {
-        const data = await callChat(trimmed, ctrl.signal);
+        const data = await callChat(trimmed, history, ctrl.signal);
         streamReply(data.reply, normalizeAgent(data.agent_used));
       } catch (err) {
         setBusy(false);

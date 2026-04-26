@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal
 from groq import Groq
 
@@ -303,6 +303,7 @@ def get_plan(request: dict = None):
 
 class ChatRequest(BaseModel):
     message: str
+    history: list[dict[str, str]] = Field(default_factory=list)
 
 class ChatResponse(BaseModel):
     reply: str
@@ -356,7 +357,7 @@ def _strip_json_fences(text: str) -> str:
     return cleaned.strip()
 
 
-def _run_strict_rag_chat(message: str) -> tuple[str, bool]:
+def _run_strict_rag_chat(message: str, history: list[dict[str, str]]) -> tuple[str, bool]:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         return "ERROR: GROQ_API_KEY is missing, so strict RAG chat cannot run.", True
@@ -414,11 +415,13 @@ def _run_strict_rag_chat(message: str) -> tuple[str, bool]:
         "inventory_issues": inventory_issues,
         "research_issues": research_issues,
         "plan": plan,
+        "history": history[-8:],
     }
 
     system_prompt = (
         "You are Sandy AI. Answer ONLY from the provided context. "
         "No keyword rules, no fallback phrasing, no invented facts. "
+        "Use the recent conversation history to resolve short follow-up questions like 'for real?' or 'what about that?'. "
         "If the data does not contain the answer, return JSON with status='error' and answer beginning with 'ERROR:'. "
         "If you can answer, return JSON with status='ok' and a concise answer grounded in the context. "
         "Always output valid JSON only, with keys: status, answer."
@@ -429,6 +432,7 @@ def _run_strict_rag_chat(message: str) -> tuple[str, bool]:
         f"Grounded context:\n{json.dumps(context, ensure_ascii=True)}\n\n"
         "Rules:\n"
         "- Use only the grounded context above.\n"
+        "- If the question is a short follow-up, use the recent conversation history to resolve what it refers to.\n"
         "- If asked about inventory, mention exact low-stock items only if they exist.\n"
         "- If asked about projects, mention exact at-risk projects only if they exist.\n"
         "- If asked what to work on, use the plan and current active projects.\n"
@@ -469,7 +473,7 @@ def chat(req: ChatRequest):
     sources = {inv_source, proj_source, exp_source}
     data_source = next(iter(sources)) if len(sources) == 1 else "mixed"
 
-    reply, is_error = _run_strict_rag_chat(req.message)
+    reply, is_error = _run_strict_rag_chat(req.message, req.history)
 
     return ChatResponse(
         reply=reply,
