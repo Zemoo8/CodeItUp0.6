@@ -1,8 +1,16 @@
+from dotenv import load_dotenv
+load_dotenv()
+
+import json
+import os
+
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict
 from typing import Literal
+from groq import Groq
 
 from db.connection import fetch_inventory, fetch_projects, fetch_experiments_log
 from agents.deepagents_orchestrator import deepagents_enabled, run_deepagents_pipeline
@@ -14,6 +22,13 @@ app = FastAPI(
     title="Sandy AI Lab",
     version="1.0.0",
     description="3-agent pipeline: Inventory → Research → Planner",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -200,6 +215,267 @@ def run_pipeline():
         inventory_issues=inventory_issues,
         research_issues=research_issues,
         plan=Plan(**raw_plan),
+    )
+
+
+# ── Individual Agent Endpoints (for chat-based frontend) ─────────────────────
+
+def _normalize_inventory(inventory: list[dict]) -> list[dict]:
+    """Normalize inventory field names."""
+    return [
+        {"item_name": i.get("item_name") or i.get("name"), "quantity": i.get("quantity", 0), 
+         "min_required": i.get("min_required", 0), "unit": i.get("unit", "")}
+        for i in inventory
+    ]
+
+
+def _normalize_projects(projects: list[dict]) -> list[dict]:
+    """Normalize project field names."""
+    return [
+        {"project_name": p.get("project_name") or p.get("name"), "status": p.get("status", "unknown"), 
+         "team": p.get("team", "Unknown"), "deadline": p.get("deadline")}
+        for p in projects
+    ]
+
+
+@app.post("/agent/inventory")
+def get_inventory_issues():
+    """Run inventory agent and return low-stock items."""
+    inventory, _ = fetch_inventory()
+    inventory = _normalize_inventory(inventory)
+    issues = run_inventory_agent(inventory)
+    return {
+        "agent": "inventory_agent",
+        "low_stock_items": [
+            {"name": item["item_name"], "quantity": item["quantity"], "min_required": item["min_required"], "shortfall": item["shortfall"], "unit": item.get("unit", "")}
+            for item in issues
+        ]
+    }
+
+
+@app.post("/agent/research")
+def get_research_issues():
+    """Run research agent and return at-risk projects."""
+    projects, _ = fetch_projects()
+    experiments, _ = fetch_experiments_log()
+    projects = _normalize_projects(projects)
+    experiments = [
+        {"project_id": e.get("project_id") or e.get("project"),
+         "status": e.get("status") or e.get("result") or ("failed" if e.get("success") is False else "success"),
+         "notes": e.get("notes") or e.get("blocker") or "Unknown issue"}
+        for e in experiments
+    ]
+    issues = run_research_agent(projects, experiments)
+    return {
+        "agent": "research_agent",
+        "at_risk_projects": [
+            {"project": issue["project_name"], "status": issue["status"], "team": issue.get("team"), "deadline": issue.get("deadline"), "blockers": issue.get("blockers", []), "notes": issue.get("notes", "")}
+            for issue in issues
+        ]
+    }
+
+
+@app.post("/agent/planner")
+def get_plan(request: dict = None):
+    """Run planner agent and return action plan."""
+    if not request:
+        inv_response = get_inventory_issues()
+        res_response = get_research_issues()
+        inventory_issues = [
+            {"item_name": item["name"], "quantity": item["quantity"], "min_required": item["min_required"], "shortfall": item["shortfall"]}
+            for item in inv_response["low_stock_items"]
+        ]
+        research_issues = [
+            {"project_name": issue["project"], "status": issue["status"], "team": issue.get("team"), "deadline": issue.get("deadline"), "blockers": issue.get("blockers", []), "notes": issue.get("notes", "")}
+            for issue in res_response["at_risk_projects"]
+        ]
+    else:
+        inventory_issues = request.get("inventory_issues", [])
+        research_issues = request.get("research_issues", [])
+    plan = run_planner_agent(inventory_issues or [], research_issues or [])
+    return {
+        "agent": "planner_agent",
+        "plan": {"summary": plan["summary"], "critical_issues": plan.get("critical_issues", []), "actions": plan.get("actions", []), "final_decision": plan["final_decision"]}
+    }
+
+
+# ── Chat models ────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    message: str
+
+class ChatResponse(BaseModel):
+    reply: str
+    data_source: str
+
+    agent_used: str | None = None
+    error: bool = False
+
+
+def _normalize_rag_inventory(inventory: list[dict]) -> list[dict]:
+    return [
+        {
+            "name": item.get("item_name") or item.get("name") or "Unknown item",
+            "quantity": item.get("quantity", 0),
+            "min_required": item.get("min_required", 0),
+            "unit": item.get("unit", ""),
+        }
+        for item in inventory
+    ]
+
+
+def _normalize_rag_projects(projects: list[dict]) -> list[dict]:
+    return [
+        {
+            "name": project.get("project_name") or project.get("name") or "Unknown project",
+            "status": project.get("status", "unknown"),
+            "team": project.get("team", "Unknown"),
+            "deadline": project.get("deadline"),
+        }
+        for project in projects
+    ]
+
+
+def _normalize_rag_experiments(experiments: list[dict]) -> list[dict]:
+    return [
+        {
+            "project_id": exp.get("project_id") or exp.get("project"),
+            "status": exp.get("status") or exp.get("result") or "unknown",
+            "notes": exp.get("notes") or exp.get("blocker") or "",
+        }
+        for exp in experiments
+    ]
+
+
+def _strip_json_fences(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+    return cleaned.strip()
+
+
+def _run_strict_rag_chat(message: str) -> tuple[str, bool]:
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return "ERROR: GROQ_API_KEY is missing, so strict RAG chat cannot run.", True
+
+    inventory, _ = fetch_inventory()
+    projects, _ = fetch_projects()
+    experiments, _ = fetch_experiments_log()
+
+    inventory_norm = _normalize_rag_inventory(inventory)
+    projects_norm = _normalize_rag_projects(projects)
+    experiments_norm = _normalize_rag_experiments(experiments)
+
+    inventory_issues = run_inventory_agent([
+        {
+            "item_name": item["name"],
+            "quantity": item["quantity"],
+            "min_required": item["min_required"],
+            "unit": item["unit"],
+        }
+        for item in inventory_norm
+    ])
+    research_issues = run_research_agent([
+        {
+            "project_name": project["name"],
+            "status": project["status"],
+            "team": project["team"],
+            "deadline": project["deadline"],
+        }
+        for project in projects_norm
+    ], experiments_norm)
+    plan = run_planner_agent([
+        {
+            "item_name": item["item_name"],
+            "quantity": item["quantity"],
+            "min_required": item["min_required"],
+            "shortfall": item["shortfall"],
+            "unit": item.get("unit", ""),
+        }
+        for item in inventory_issues
+    ], [
+        {
+            "project_name": issue["project_name"],
+            "status": issue["status"],
+            "team": issue.get("team"),
+            "deadline": issue.get("deadline"),
+            "blockers": issue.get("blockers", []),
+        }
+        for issue in research_issues
+    ])
+
+    context = {
+        "inventory": inventory_norm,
+        "projects": projects_norm,
+        "experiments": experiments_norm,
+        "inventory_issues": inventory_issues,
+        "research_issues": research_issues,
+        "plan": plan,
+    }
+
+    system_prompt = (
+        "You are Sandy AI. Answer ONLY from the provided context. "
+        "No keyword rules, no fallback phrasing, no invented facts. "
+        "If the data does not contain the answer, return JSON with status='error' and answer beginning with 'ERROR:'. "
+        "If you can answer, return JSON with status='ok' and a concise answer grounded in the context. "
+        "Always output valid JSON only, with keys: status, answer."
+    )
+
+    user_prompt = (
+        f"Question: {message}\n\n"
+        f"Grounded context:\n{json.dumps(context, ensure_ascii=True)}\n\n"
+        "Rules:\n"
+        "- Use only the grounded context above.\n"
+        "- If asked about inventory, mention exact low-stock items only if they exist.\n"
+        "- If asked about projects, mention exact at-risk projects only if they exist.\n"
+        "- If asked what to work on, use the plan and current active projects.\n"
+        "- If asked about experiments and there is no experiment catalog, return error.\n"
+        "- Do not mention unsupported data as if it exists.\n"
+    )
+
+    client = Groq(api_key=api_key)
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=500,
+        )
+        raw = response.choices[0].message.content or ""
+        parsed = json.loads(_strip_json_fences(raw))
+        status = str(parsed.get("status", "error")).lower()
+        answer = str(parsed.get("answer", "")).strip()
+        if status != "ok" or not answer:
+            return (answer if answer.startswith("ERROR:") else "ERROR: The model could not answer from the available data."), True
+        if answer.lower().startswith("i don't know") or answer.lower().startswith("i do not know"):
+            return "ERROR: The model could not answer from the available data.", True
+        return answer, False
+    except Exception as exc:
+        return f"ERROR: The chat model failed with {exc.__class__.__name__}.", True
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    """Strict RAG chat endpoint - no keyword matching or fallback replies."""
+    inventory, inv_source = fetch_inventory()
+    projects, proj_source = fetch_projects()
+    experiments, exp_source = fetch_experiments_log()
+    sources = {inv_source, proj_source, exp_source}
+    data_source = next(iter(sources)) if len(sources) == 1 else "mixed"
+
+    reply, is_error = _run_strict_rag_chat(req.message)
+
+    return ChatResponse(
+        reply=reply,
+        data_source=data_source,
+        agent_used="rag_agent",
+        error=is_error,
     )
 
 

@@ -7,7 +7,7 @@ from agents.inventory_agent import run_inventory_agent
 from agents.research_agent import run_research_agent
 from agents.planner_agent import run_planner_agent
 
-BASE_URL = "http://192.168.1.118:8000"
+BASE_URL = "http://192.168.168.85:8000"
 
 # Allow users to paste a docs URL without breaking endpoint requests.
 if BASE_URL.rstrip("/").endswith("/docs"):

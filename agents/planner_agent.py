@@ -1,82 +1,4 @@
-import json
-import os
 from typing import Any
-
-import requests
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    # dotenv is optional at runtime; environment variables still work without it.
-    pass
-
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-
-
-def _enhance_plan_with_groq(plan: dict[str, Any]) -> dict[str, Any]:
-    """Optionally refine summary and final decision using Groq.
-
-    The deterministic planner output is always produced first; this only rewrites
-    text fields when GROQ_API_KEY is configured and the API call succeeds.
-    """
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
-        return plan
-
-    prompt_payload = {
-        "summary": plan.get("summary", ""),
-        "critical_issues": plan.get("critical_issues", []),
-        "actions": plan.get("actions", []),
-        "final_decision": plan.get("final_decision", ""),
-    }
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an operations planning assistant. "
-                "Rewrite only summary and final_decision to be clear and concise. "
-                "Return valid JSON with keys: summary, final_decision."
-            ),
-        },
-        {
-            "role": "user",
-            "content": json.dumps(prompt_payload, ensure_ascii=True),
-        },
-    ]
-
-    try:
-        response = requests.post(
-            GROQ_API_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": messages,
-                "temperature": 0.2,
-            },
-            timeout=12,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
-
-        if isinstance(parsed, dict):
-            summary = parsed.get("summary")
-            final_decision = parsed.get("final_decision")
-            if isinstance(summary, str) and summary.strip():
-                plan["summary"] = summary.strip()
-            if isinstance(final_decision, str) and final_decision.strip():
-                plan["final_decision"] = final_decision.strip()
-    except Exception:
-        # Keep deterministic output if LLM call fails or returns invalid JSON.
-        return plan
-
-    return plan
 
 
 def _severity_for_inventory(item: dict[str, Any]) -> str:
@@ -193,4 +115,4 @@ def run_planner_agent(
         "final_decision": final_decision,
     }
 
-    return _enhance_plan_with_groq(plan)
+    return plan
