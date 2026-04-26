@@ -6,7 +6,7 @@ DB_CONFIG = {
     "user": "sandy",
     "password": "sandy123",
     "host": "localhost",
-    "port": "5432"
+    "port": "5433"
 }
 
 
