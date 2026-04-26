@@ -3,6 +3,7 @@ load_dotenv()
 
 import json
 import os
+import time
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -357,6 +358,27 @@ def _strip_json_fences(text: str) -> str:
     return cleaned.strip()
 
 
+def _is_rate_limited_error(exc: Exception) -> bool:
+    name = exc.__class__.__name__.lower()
+    msg = str(exc).lower()
+    return (
+        "ratelimit" in name
+        or "rate limit" in msg
+        or "too many requests" in msg
+        or "status code: 429" in msg
+    )
+
+
+def _candidate_groq_models() -> list[str]:
+    configured = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    models = [m.strip() for m in configured.split(",") if m.strip()]
+    # Keep a smaller backup model to reduce rate-limit failures.
+    for backup in ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]:
+        if backup not in models:
+            models.append(backup)
+    return models
+
+
 def _run_strict_rag_chat(message: str, history: list[dict[str, str]]) -> tuple[str, bool]:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -441,25 +463,43 @@ def _run_strict_rag_chat(message: str, history: list[dict[str, str]]) -> tuple[s
     )
 
     client = Groq(api_key=api_key)
+    last_error: Exception | None = None
     try:
-        response = client.chat.completions.create(
-            model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.1,
-            max_tokens=500,
-        )
-        raw = response.choices[0].message.content or ""
-        parsed = json.loads(_strip_json_fences(raw))
-        status = str(parsed.get("status", "error")).lower()
-        answer = str(parsed.get("answer", "")).strip()
-        if status != "ok" or not answer:
-            return (answer if answer.startswith("ERROR:") else "ERROR: The model could not answer from the available data."), True
-        if answer.lower().startswith("i don't know") or answer.lower().startswith("i do not know"):
-            return "ERROR: The model could not answer from the available data.", True
-        return answer, False
+        for model in _candidate_groq_models():
+            for attempt in range(3):
+                try:
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=0.1,
+                        max_tokens=350,
+                    )
+                    raw = response.choices[0].message.content or ""
+                    parsed = json.loads(_strip_json_fences(raw))
+                    status = str(parsed.get("status", "error")).lower()
+                    answer = str(parsed.get("answer", "")).strip()
+                    if status != "ok" or not answer:
+                        return (answer if answer.startswith("ERROR:") else "ERROR: The model could not answer from the available data."), True
+                    if answer.lower().startswith("i don't know") or answer.lower().startswith("i do not know"):
+                        return "ERROR: The model could not answer from the available data.", True
+                    return answer, False
+                except Exception as exc:
+                    last_error = exc
+                    if _is_rate_limited_error(exc):
+                        # Short backoff, then retry the same model; then fail over.
+                        if attempt < 2:
+                            time.sleep(0.6 * (attempt + 1))
+                            continue
+                        break
+                    raise
+        if last_error and _is_rate_limited_error(last_error):
+            return "ERROR: Chat provider is rate-limited right now. Retry in a few seconds.", True
+        if last_error:
+            return f"ERROR: The chat model failed with {last_error.__class__.__name__}.", True
+        return "ERROR: The chat model did not return a response.", True
     except Exception as exc:
         return f"ERROR: The chat model failed with {exc.__class__.__name__}.", True
 
